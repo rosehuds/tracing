@@ -344,7 +344,6 @@ fn gen_body(
         ..
     } = sig;
 
-    let err = args.err;
     let warnings = args.warnings();
 
     // generate the span's name
@@ -396,7 +395,7 @@ fn gen_body(
             }
         }
 
-        let level = args.level();
+        let level = InstrumentArgs::level(&args.level);
         let target = args.target();
 
         // filter out skipped fields
@@ -451,7 +450,8 @@ fn gen_body(
     // enter the span and then perform the rest of the body.
     // If `err` is in args, instrument any resulting `Err`s.
     let body = if asyncness.is_some() {
-        if err {
+        if let Some(level) = args.err {
+            let level = InstrumentArgs::level(&Some(level));
             quote_spanned! {block.span()=>
                 let __tracing_attr_span = #span;
                 tracing::Instrument::instrument(async move {
@@ -459,7 +459,7 @@ fn gen_body(
                         #[allow(clippy::unit_arg)]
                         Ok(x) => Ok(x),
                         Err(e) => {
-                            tracing::error!(error = %e);
+                            tracing::event!(#level, error = %e);
                             Err(e)
                         }
                     }
@@ -475,7 +475,8 @@ fn gen_body(
                     .await
             )
         }
-    } else if err {
+    } else if let Some(level) = args.err {
+        let level = InstrumentArgs::level(&Some(level));
         quote_spanned!(block.span()=>
             let __tracing_attr_span = #span;
             let __tracing_attr_guard = __tracing_attr_span.enter();
@@ -484,7 +485,7 @@ fn gen_body(
                 #[allow(clippy::unit_arg)]
                 Ok(x) => Ok(x),
                 Err(e) => {
-                    tracing::error!(error = %e);
+                    tracing::event!(#level, error = %e);
                     Err(e)
                 }
             }
@@ -516,13 +517,13 @@ struct InstrumentArgs {
     skip_all: bool,
     skips: HashSet<Ident>,
     fields: Option<Fields>,
-    err: bool,
+    err: Option<Level>,
     /// Errors describing any unrecognized parse inputs that we skipped.
     parse_warnings: Vec<syn::Error>,
 }
 
 impl InstrumentArgs {
-    fn level(&self) -> impl ToTokens {
+    fn level(level: &Option<Level>) -> impl ToTokens {
         fn is_level(lit: &LitInt, expected: u64) -> bool {
             match lit.base10_parse::<u64>() {
                 Ok(value) => value == expected,
@@ -530,7 +531,7 @@ impl InstrumentArgs {
             }
         }
 
-        match &self.level {
+        match level {
             Some(Level::Str(ref lit)) if lit.value().eq_ignore_ascii_case("trace") => {
                 quote!(tracing::Level::TRACE)
             }
@@ -628,6 +629,8 @@ impl Parse for InstrumentArgs {
                 if args.level.is_some() {
                     return Err(input.error("expected only a single `level` argument"));
                 }
+                let _ = input.parse::<kw::level>()?;
+                let _ = input.parse::<Token![=]>()?;
                 args.level = Some(input.parse()?);
             } else if lookahead.peek(kw::skip_all) {
                 let _ = input.parse::<kw::skip_all>()?;
@@ -644,8 +647,12 @@ impl Parse for InstrumentArgs {
                 }
                 args.fields = Some(input.parse()?);
             } else if lookahead.peek(kw::err) {
+                if args.err.is_some() {
+                    return Err(input.error("expected only a single `err` argument"));
+                }
                 let _ = input.parse::<kw::err>()?;
-                args.err = true;
+                let _ = input.parse::<Token![=]>()?;
+                args.err = Some(input.parse()?);
             } else if lookahead.peek(Token![,]) {
                 let _ = input.parse::<Token![,]>()?;
             } else {
@@ -806,8 +813,6 @@ enum Level {
 
 impl Parse for Level {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let _ = input.parse::<kw::level>()?;
-        let _ = input.parse::<Token![=]>()?;
         let lookahead = input.lookahead1();
         if lookahead.peek(LitStr) {
             Ok(Self::Str(input.parse()?))
